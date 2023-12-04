@@ -1,0 +1,250 @@
+#include <stdint.h>
+#include <avr/io.h>
+#include <avr/pgmspace.h>
+
+#define MOSI PB2
+#define SPIPORT PORTB
+
+ void  WS_bit1() {
+  SPIPORT |= (1<<MOSI);
+  asm ("nop\n nop\n nop\n nop\n nop\n nop\n");
+  asm ("nop\n nop\n nop\n nop\n nop\n nop\n");
+  SPIPORT &= ~(1<<MOSI);
+  asm ("nop\n nop\n nop\n nop\n");
+}
+
+ void  WS_bit0() {
+  SPIPORT |= (1<<MOSI);
+  asm ("nop\n nop\n nop\n");
+  SPIPORT &= ~(1<<MOSI);
+  asm ("nop\n nop\n nop\n nop\n nop\n nop\n");
+  asm ("nop\n nop\n nop\n nop\n");
+}
+
+#define WAIT_SHORT asm("nop\n nop\n");
+#define WAIT_LONG  asm("nop\n nop\n nop\n nop\n nop\n nop\n nop\n nop\n");
+#define MOSI_HI PORTB|=(1<<MOSI);
+#define MOSI_LO PORTB&=~(1<<MOSI);
+#define BIT1 MOSI_HI WAIT_LONG MOSI_LO WAIT_SHORT
+#define BIT0 MOSI_HI WAIT_SHORT MOSI_LO WAIT_LONG
+#define BITOUT(data) if (data & 0x80) {BIT1} else {BIT0}
+
+void send_WS_Byte(uint8_t data) {
+  BITOUT(data); data=data<<1;
+  BITOUT(data); data=data<<1;
+  BITOUT(data); data=data<<1;
+  BITOUT(data); data=data<<1;
+  BITOUT(data); data=data<<1;
+  BITOUT(data); data=data<<1;
+  BITOUT(data); data=data<<1;
+  BITOUT(data);
+ }
+
+uint8_t spi_buffer[12];
+
+void setup_WS_SPI() {
+  // Bit rate WS=1.34us
+  // T1H = 650ns , T1L=650ns
+  // T0H = 300ns, T1L = 1040ns
+  // Can we fake it into SPI bit rate 1/335ns = 2.98MHz?
+  // T1H = 2bit T1L=1 bit
+  // T0H = 1bit T0L=2 bit
+  // SPI setup:
+  // - clk = fcpu / 2, 4, 8, 16... fcpu= 16MHz --> 16/4 = 4MHz
+  //   -> 0bit = 1000, 1bit = 1100
+  //   24 bit data --> 96bit SPI (12 bytes per LED)
+  // SPCR (SPI control register)
+  //  7:SPIE = interrupt enable
+  //  6:SPE  = enable
+  //  5:DORD = data order , 0=LSB first, 1 = MSB first
+  //  4:MSTR = master, 1=master ,0=slave
+  //  3:CPOL = clock polarity, dont care
+  //  2:CPHA = clock phase, dont care
+  //  1:0:SPR1:0 = SPI rate 00 = fcpu/4
+  // SPSR : SPI status reg
+  //  7:SPIF = interrupt flag (also when finished)
+  //  6:WCOL = write collision
+  //  0:SPI2X = double speed
+  // SPDR: SPI data reg
+  // SPI--> Total failure, SPI idle state is MOSI HIGH... also, no double buffering
+  DDRB|=(1<<MOSI);
+  SPCR=(1<<SPE)+(0<<DORD)+(1<<MSTR);
+  // Pre-fill SPI data buffer:
+  for (uint8_t i = 0; i < 12; i++)
+  {
+    spi_buffer[i]=0b10001000;
+  }
+}
+
+#define TXOFF UCSR1B&=~(1<<TXEN1);
+#define TXON  UCSR1B|= (1<<TXEN1);
+
+void setup_WS_USART() {
+  /*
+  USART in SPI mode... UART it itself also has idle state = High :(
+  UCSR1A: Status reg
+    7: RX complete
+    6: TX complete
+    5: data reg empty
+  UCSR1B: control reg B
+    7: RX int enable
+    6: TX int enable
+    5: data reg empty int enable
+    4: RX enable
+    3: TX enable - writing TX = 0 will complete pending transmissions first!
+  UCSR1C: Control reg C
+    7:6: USART Mode , 11 = MSPIM (SPI mode)
+    2: UDORD : data order 0=MSB first
+    1,0 Clock phase and pol... ignore
+  UBRRx : baud rate reg:
+    UBRR = fosc / 2baud - 1 
+    baud rate= 2.9MBaud , fosc = 16MHz
+    UBRR = 16e9 / 2.9e9 -  1 = 4.5 :/
+    UBRR = 4 or 5... let's see..
+  */
+  UBRR1=2;
+  UCSR1C = (1<<UMSEL11)+(1<<UMSEL10);
+  // TX is on PD3
+  DDRD|=(1<<PD3);
+  PORTD&=~(1<<PD3);
+}
+
+void send_SPI_byte(uint8_t data) {
+  SPDR=data;
+  while(!(SPSR & (1<<SPIE)));
+}
+
+void send_USART_byte(uint8_t data) {
+  while(!(UCSR1A & (1<<UDRE1)));
+  TXON;
+  UDR1=data;
+}
+
+uint8_t translate_2bits_to_spi(uint8_t data) {
+  switch (data & 0b11000000)
+    {
+    case 0b00000000:
+      return 0b10001000;
+      break;
+    case 0b01000000:
+      return 0b10001100;
+      break;
+    case 0b10000000:
+      return 0b11001000;
+      break;
+    case 0b11000000:
+      return 0b11001100;
+      break;
+    }
+  return 0;
+}
+
+void send_WS_SPI(uint8_t r, uint8_t g, uint8_t b) {
+  // WS data frame: high bits first, Green, Red, Blue order
+  for (uint8_t i = 0; i < 4; i++)
+  {
+    spi_buffer[i]=translate_2bits_to_spi(g);
+    g=g<<2;
+    spi_buffer[i+4]=translate_2bits_to_spi(r);
+    r=r<<2;
+    spi_buffer[i+8]=translate_2bits_to_spi(b);
+    b=b<<2;
+  }
+  for (uint8_t i = 0; i < 12; i++)
+  {
+    SPDR=spi_buffer[i];
+    while((SPSR & (1<<SPIE)) == 0) ;
+  }
+  
+  
+}
+void send_WS_USART(uint8_t r, uint8_t g, uint8_t b) {
+  // WS data frame: high bits first, Green, Red, Blue order
+  for (uint8_t i = 0; i < 4; i++)
+  {
+    spi_buffer[i]=translate_2bits_to_spi(g);
+    g=g<<2;
+    spi_buffer[i+4]=translate_2bits_to_spi(r);
+    r=r<<2;
+    spi_buffer[i+8]=translate_2bits_to_spi(b);
+    b=b<<2;
+  }
+  for (uint8_t i = 0; i < 12; i++)
+  {
+    send_USART_byte(spi_buffer[i]);
+  }
+  TXOFF;
+}
+
+void send_WS_BitBang(uint8_t r, uint8_t g, uint8_t b) {
+  // WS data frame: high bits first, Green, Red, Blue order
+  send_WS_Byte(g);
+  send_WS_Byte(r);
+  send_WS_Byte(b);
+}
+
+void setup() {
+  // TX LED = PB0
+  // RX LED = PD5
+  DDRB |= (1<<PB0)+(1<<MOSI);
+  DDRD |= (1<<PD5);
+  //setup_WS_SPI();
+  setup_WS_USART();
+}
+
+void TXLED() {
+  PORTD |= (1<<PD5);
+  PORTB &= ~(1<<PB0);
+}
+void RXLED() {
+  PORTD &= ~(1<<PD5);
+  PORTB |=  (1<<PB0);
+}
+
+void wait() {
+  for (volatile uint16_t i = 1; i!=0; i++) ;
+}
+void wait50us() {
+  for (volatile uint16_t i = -400; i!=0; i++) ;
+}
+
+void send_ws_test() {
+  static uint8_t num_blanks=0;
+  for (uint8_t i = 0; i < num_blanks; i++)
+  {
+    for (uint8_t j = 0; j < 24; j++)
+    {
+      WS_bit0();
+    }
+  }
+  if (num_blanks<30) {
+  for( uint8_t i = 0;i<24;i++) {
+    WS_bit1();
+  }}
+  num_blanks++;
+  if (num_blanks>30) num_blanks=0;
+  wait50us();
+}
+
+#define SPION SPCR|=(1<<SPE);
+#define SPIOFF SPCR&=~(1<<SPE);
+#define MOSILOW PORTB&=~(1<<MOSI); DDRB|=(1<<MOSI);
+
+int main() {
+  setup();
+  for(;;) {
+    TXLED();
+    wait();
+    RXLED();
+    for (uint8_t i = 0; i < 15; i++)
+    {
+      send_USART_byte(0);
+    }
+    send_WS_BitBang(20,00,0);
+    send_WS_BitBang(00,40,0);
+    send_WS_BitBang(00,00,80);
+
+    
+    wait50us();
+  }
+}
