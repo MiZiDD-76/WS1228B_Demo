@@ -8,9 +8,15 @@ If the transmission stops, it will output the data to the WS2812B string on pin
 "MOSI", and starts waiting again.
 
 A python demo application simulates moving "sprites" on the strip and sends
-a new frame every 1/60s. The data format is one byte per RGB value for each LED:
+a new frame every 1/60s. The data format is: datalength + one byte per RGB value for each LED:
+  
+  lowbyte(data_length), highbyte(data_length)
+  R1 G1 B1 R2 G2 B3 .... Rn Gn Bn.
 
-  R1 G1 B1 R2 G2 B3 .... Rn Gn Bn. 
+If data_length is zero, all LEDs will be turned off.
+
+If a 2 sec timeout occurs, before all expected data bytes (including high byte of data_length)
+are received, all LEDs will be switched off and a new data frame is expected.
 
 ## Hardware
 
